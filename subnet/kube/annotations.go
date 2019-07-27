@@ -26,6 +26,7 @@ type annotations struct {
 	BackendType              string
 	BackendPublicIP          string
 	BackendPublicIPOverwrite string
+	PodCIDR                  string
 }
 
 func newAnnotations(prefix string) (annotations, error) {
@@ -60,6 +61,7 @@ func newAnnotations(prefix string) (annotations, error) {
 		BackendType:              prefix + "backend-type",
 		BackendPublicIP:          prefix + "public-ip",
 		BackendPublicIPOverwrite: prefix + "public-ip-overwrite",
+		PodCIDR:                  prefix + "pod-cidr",
 	}
 
 	return a, nil
