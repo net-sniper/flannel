@@ -19,8 +19,10 @@ import (
 	"errors"
 	"fmt"
 	"io/ioutil"
+	"math/rand"
 	"net"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/coreos/flannel/pkg/ip"
@@ -28,7 +30,9 @@ import (
 
 	"github.com/golang/glog"
 	"golang.org/x/net/context"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/strategicpatch"
@@ -55,8 +59,11 @@ const (
 	backendDataAnnotation       = "flannel.alpha.coreos.com/backend-data"
 	backendTypeAnnotation       = "flannel.alpha.coreos.com/backend-type"
 	backendPublicIPAnnotation   = "flannel.alpha.coreos.com/public-ip"
+	FlannelPodCIDRAnnotation    = "flannel.alpha.coreos.com/pod-cidr"
 
 	netConfPath = "/etc/kube-flannel/net-conf.json"
+
+	flannelPodCIDRConfigmapName = "flannel-pod-cidr"
 )
 
 type kubeSubnetManager struct {
@@ -66,6 +73,8 @@ type kubeSubnetManager struct {
 	nodeController cache.Controller
 	subnetConf     *subnet.Config
 	events         chan subnet.Event
+
+	podNamespace string
 }
 
 func NewSubnetManager(apiUrl, kubeconfig string) (subnet.Manager, error) {
@@ -94,9 +103,9 @@ func NewSubnetManager(apiUrl, kubeconfig string) (subnet.Manager, error) {
 	// If we're running as a pod then the POD_NAME and POD_NAMESPACE will be populated and can be used to find the node
 	// name. Otherwise, the environment variable NODE_NAME can be passed in.
 	nodeName := os.Getenv("NODE_NAME")
+	podNamespace := os.Getenv("POD_NAMESPACE")
 	if nodeName == "" {
 		podName := os.Getenv("POD_NAME")
-		podNamespace := os.Getenv("POD_NAMESPACE")
 		if podName == "" || podNamespace == "" {
 			return nil, fmt.Errorf("env variables POD_NAME and POD_NAMESPACE must be set")
 		}
@@ -125,6 +134,7 @@ func NewSubnetManager(apiUrl, kubeconfig string) (subnet.Manager, error) {
 	if err != nil {
 		return nil, fmt.Errorf("error creating network manager: %s", err)
 	}
+	sm.podNamespace = podNamespace
 	go sm.Run(context.Background())
 
 	glog.Infof("Waiting %s for node controller to sync", nodeControllerSyncTimeout)
@@ -133,6 +143,13 @@ func NewSubnetManager(apiUrl, kubeconfig string) (subnet.Manager, error) {
 	})
 	if err != nil {
 		return nil, fmt.Errorf("error waiting for nodeController to sync state: %v", err)
+	}
+
+	if err := sm.ensureFlannelPodCIDRConfigmap(); err != nil {
+		return nil, fmt.Errorf("ensure flannel pod CIDR configmap error:%v", err)
+	}
+	if err := sm.allocCIDRToNode(); err != nil {
+		return nil, fmt.Errorf("alloc CIDR to node error:%v", err)
 	}
 	glog.Infof("Node controller sync successful")
 
@@ -221,14 +238,15 @@ func (ksm *kubeSubnetManager) AcquireLease(ctx context.Context, attrs *subnet.Le
 	}
 	n := nobj.(*v1.Node)
 
-	if n.Spec.PodCIDR == "" {
+	flannelPodCIDR := nodeGetCIDR(n)
+	if flannelPodCIDR == "" {
 		return nil, fmt.Errorf("node %q pod cidr not assigned", ksm.nodeName)
 	}
 	bd, err := attrs.BackendData.MarshalJSON()
 	if err != nil {
 		return nil, err
 	}
-	_, cidr, err := net.ParseCIDR(n.Spec.PodCIDR)
+	_, cidr, err := net.ParseCIDR(flannelPodCIDR)
 	if err != nil {
 		return nil, err
 	}
@@ -293,7 +311,7 @@ func nodeToLease(n v1.Node) (l subnet.Lease, err error) {
 	l.Attrs.BackendType = n.Annotations[backendTypeAnnotation]
 	l.Attrs.BackendData = json.RawMessage(n.Annotations[backendDataAnnotation])
 
-	_, cidr, err := net.ParseCIDR(n.Spec.PodCIDR)
+	_, cidr, err := net.ParseCIDR(nodeGetCIDR(&n))
 	if err != nil {
 		return l, err
 	}
@@ -313,4 +331,154 @@ func (ksm *kubeSubnetManager) WatchLease(ctx context.Context, sn ip.IP4Net, curs
 
 func (ksm *kubeSubnetManager) Name() string {
 	return fmt.Sprintf("Kubernetes Subnet Manager - %s", ksm.nodeName)
+}
+
+func nodeGetCIDR(n *v1.Node) string {
+	cidr := n.Annotations[flannelPodCIDRConfigmapName]
+	return cidr
+}
+
+func (ksm *kubeSubnetManager) ensureFlannelPodCIDRConfigmap() error {
+	_, err := ksm.client.CoreV1().ConfigMaps(ksm.podNamespace).Get(flannelPodCIDRConfigmapName, metav1.GetOptions{})
+	if err != nil && !k8serrors.IsNotFound(err) {
+		glog.Errorf("get flannel pod cidr configmap error:%v", err)
+		return err
+	} else if err == nil {
+		return nil
+	}
+
+	cm := &v1.ConfigMap{}
+	cm.Name = flannelPodCIDRConfigmapName
+	cm.Kind = "ConfigMap"
+	cm.APIVersion = "v1"
+	_, err = ksm.client.CoreV1().ConfigMaps(ksm.podNamespace).Create(cm)
+	if err != nil {
+		glog.Errorf("create flannel pod cidr configmap error:%v", err)
+	}
+	return nil
+}
+
+func (ksm *kubeSubnetManager) patchNode(oldNode, newNode *v1.Node) error {
+	oldData, err := json.Marshal(oldNode)
+	if err != nil {
+		return err
+	}
+
+	newData, err := json.Marshal(newNode)
+	if err != nil {
+		return err
+	}
+
+	patchBytes, err := strategicpatch.CreateTwoWayMergePatch(oldData, newData, v1.Node{})
+	if err != nil {
+		return fmt.Errorf("failed to create patch for node %q: %v", ksm.nodeName, err)
+	}
+
+	_, err = ksm.client.CoreV1().Nodes().Patch(ksm.nodeName, types.StrategicMergePatchType, patchBytes, "status")
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (ksm *kubeSubnetManager) allocateSubnet(config *subnet.Config, ipnets []ip.IP4Net) (ip.IP4Net, error) {
+	glog.Infof("Picking subnet in range %s ... %s", config.SubnetMin, config.SubnetMax)
+
+	var bag []ip.IP4
+	sn := ip.IP4Net{IP: config.SubnetMin, PrefixLen: config.SubnetLen}
+
+OuterLoop:
+	for ; sn.IP <= config.SubnetMax && len(bag) < 100; sn = sn.Next() {
+		for _, ip := range ipnets {
+			if sn.Overlaps(ip) {
+				continue OuterLoop
+			}
+		}
+		bag = append(bag, sn.IP)
+	}
+
+	if len(bag) == 0 {
+		return ip.IP4Net{}, errors.New("out of subnets")
+	}
+
+	i := randInt(0, len(bag))
+	return ip.IP4Net{IP: bag[i], PrefixLen: config.SubnetLen}, nil
+}
+
+func (ksm *kubeSubnetManager) allocCIDRToNode() error {
+again:
+	cachedNode, err := ksm.nodeStore.Get(ksm.nodeName)
+	if err != nil {
+		glog.Errorf("get cached node:%s error:%v", ksm.nodeName, err)
+		return err
+	}
+	nobj, err := api.Scheme.DeepCopy(cachedNode)
+	if err != nil {
+		glog.Errorf("deep copy node error:%v", err)
+		return err
+	}
+	n := nobj.(*v1.Node)
+
+	cidr := nodeGetCIDR(n)
+	if cidr != "" && !strings.HasPrefix(cidr, "-") {
+		return nil
+	}
+
+	cm, err := ksm.client.CoreV1().ConfigMaps(ksm.podNamespace).Get(flannelPodCIDRConfigmapName, metav1.GetOptions{})
+	if err != nil && !k8serrors.IsNotFound(err) {
+		glog.Errorf("get flannel pod cidr configmap error:%v", err)
+		return err
+	}
+
+	nodes, err := ksm.nodeStore.List(labels.Everything())
+	if err != nil {
+		glog.Errorf("list all nodes error:%v", err)
+		return err
+	}
+
+	ipnets := []ip.IP4Net{}
+	for _, n := range nodes {
+		cidr := nodeGetCIDR(n)
+		if cidr == "" {
+			continue
+		}
+		if strings.HasPrefix(cidr, "-") {
+			cidr = strings.TrimPrefix(cidr, "-")
+		}
+		_, ipnet, err := net.ParseCIDR(cidr)
+		if err != nil {
+			glog.Infof("parse CIDR %s error:%v", cidr, err)
+		}
+		ipnets = append(ipnets, ip.FromIPNet(ipnet))
+	}
+
+	config, _ := ksm.GetNetworkConfig(context.Background())
+	ipnet, err := ksm.allocateSubnet(config, ipnets)
+	if err != nil {
+		glog.Errorf("allocate subnet error:%v", err)
+		return err
+	}
+
+	n.Annotations[FlannelPodCIDRAnnotation] = "-" + ipnet.String()
+	if err := ksm.patchNode(cachedNode, n); err != nil {
+		glog.Errorf("patch node error:%v", err)
+		return err
+	}
+
+	if _, err := ksm.client.CoreV1().ConfigMaps(ksm.podNamespace).Update(cm); err != nil {
+		glog.Infof("update configmap error:%v", err)
+		goto again
+	}
+	n.Annotations[FlannelPodCIDRAnnotation] = ipnet.String()
+	if err := ksm.patchNode(cachedNode, n); err != nil {
+		glog.Errorf("patch node error:%v", err)
+		return err
+	}
+	return nil
+}
+
+var rnd *rand.Rand
+
+func randInt(lo, hi int) int {
+	return lo + int(rnd.Int31n(int32(hi-lo)))
 }
